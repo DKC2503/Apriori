@@ -1,0 +1,1 @@
+Place the official WEKA JAR here as weka.jar before building/deploying. Download from https://www.cs.waikato.ac.nz/ml/weka/. Keep this folder in the repository so Docker COPY succeeds. Confirm the applicable WEKA distribution terms for your use.

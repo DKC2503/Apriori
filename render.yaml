@@ -1,0 +1,7 @@
+services:
+  - type: web
+    name: elibrary-apriori-api
+    runtime: docker
+    plan: free
+    dockerfilePath: ./backend/Dockerfile
+    healthCheckPath: /health
