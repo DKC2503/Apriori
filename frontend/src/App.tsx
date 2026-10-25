@@ -99,13 +99,46 @@ export default function App() {
         body: formData,
       });
 
-      const json = await response.json();
-      if (!response.ok) {
-        throw new Error(json.detail || 'Analysis request failed.');
+      let json: any = null;
+      try {
+        json = await response.json();
+      } catch {
+        // Response was not JSON (e.g. 502/504 HTML error page from Render proxy)
       }
+
+      if (!response.ok) {
+        if (json && json.detail) {
+          throw new Error(json.detail);
+        }
+        if (response.status === 502) {
+          throw new Error(
+            'Backend server temporarily unavailable (HTTP 502 Bad Gateway). On Render free tier, the instance may be spinning up from sleep (~50s delay) or restarted due to resource limits. Please wait a moment and try again.'
+          );
+        }
+        if (response.status === 504) {
+          throw new Error(
+            'Analysis timed out (HTTP 504 Gateway Timeout). The server took too long to complete the analysis. Try adjusting the threshold or support settings.'
+          );
+        }
+        if (response.status === 413) {
+          throw new Error('Upload rejected: File size exceeds the 100 MiB limit (HTTP 413).');
+        }
+        if (response.status === 429) {
+          throw new Error('Server busy (HTTP 429): Another analysis is currently running. Please wait a moment and try again.');
+        }
+        throw new Error(`Server returned error HTTP ${response.status}: ${response.statusText || 'Analysis failed'}`);
+      }
+
       setData(json);
     } catch (e: any) {
-      setError(e.message || 'Could not connect to the backend server. Please verify it is running.');
+      const msg = e.message || '';
+      if (msg.includes('Failed to fetch') || msg.includes('NetworkError') || e.name === 'TypeError') {
+        setError(
+          'Could not connect to the backend server. If using Render free tier, the backend may be spinning up from sleep (~50s delay). Please verify the backend URL is reachable and try again.'
+        );
+      } else {
+        setError(msg);
+      }
     } finally {
       setBusy(false);
     }

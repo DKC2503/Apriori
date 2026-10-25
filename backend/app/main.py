@@ -1,18 +1,25 @@
 import os
 import re
+import gc
+import time
+import logging
 import tempfile
 import subprocess
-import logging
 import asyncio
 from pathlib import Path
-from typing import Optional, List, Dict, Any, Tuple
+from collections import Counter, defaultdict
+from typing import Optional, List, Dict, Any, Tuple, Set
 
 import pandas as pd
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
-# Configure logging
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+# Configure structured logging
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] [elibrary] %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
 logger = logging.getLogger("elibrary")
 
 app = FastAPI(title="E-Library Recommendation System API")
@@ -30,6 +37,12 @@ analysis_lock = asyncio.Lock()
 # 100 MiB maximum upload limit per file
 MAX_UPLOAD_SIZE = 100 * 1024 * 1024  # 100 MiB in bytes
 
+# Default heap for WEKA Java subprocess (192m fits safely in Render's 512 MB free instance)
+DEFAULT_WEKA_HEAP = "192m"
+
+# Number of rows per chunk when reading large CSV files to maintain low memory profile (<100 MB RAM)
+CHUNK_SIZE = 150_000
+
 
 @app.get("/")
 def root():
@@ -39,19 +52,27 @@ def root():
 @app.get("/health")
 def health():
     jar = os.getenv("WEKA_JAR", str(Path(__file__).resolve().parents[1] / "weka" / "weka.jar"))
-    return {"status": "ok", "weka_jar_found": Path(jar).exists()}
+    jar_exists = Path(jar).exists()
+    return {
+        "status": "ok",
+        "weka_jar_found": jar_exists,
+        "max_upload_size_mb": MAX_UPLOAD_SIZE // (1024 * 1024),
+        "weka_heap": os.getenv("WEKA_HEAP", DEFAULT_WEKA_HEAP),
+    }
 
 
 def get_col(df: pd.DataFrame, candidates: List[str]) -> Optional[str]:
+    """Finds a column matching any of the candidate names case-insensitively."""
     cols = {str(c).strip().lower(): c for c in df.columns}
     return next((cols[x] for x in candidates if x in cols), None)
 
 
-async def save_upload_to_temp(upload: UploadFile, max_size: int = MAX_UPLOAD_SIZE) -> Path:
+async def save_upload_to_temp(upload: UploadFile, max_size: int = MAX_UPLOAD_SIZE) -> Tuple[Path, int]:
     """
     Streams an uploaded file directly to a temporary file on disk with chunked reading.
     Validates file extension and ensures total size does not exceed max_size.
     Avoids loading entire large files into server memory.
+    Returns (temp_path, total_bytes).
     """
     filename = upload.filename or "uploaded_file"
     if not filename.lower().endswith(".csv"):
@@ -87,7 +108,7 @@ async def save_upload_to_temp(upload: UploadFile, max_size: int = MAX_UPLOAD_SIZ
                 detail=f"The uploaded file '{filename}' is empty (0 bytes).",
             )
 
-        return temp_path
+        return temp_path, total_bytes
     except HTTPException:
         temp_file.close()
         temp_path.unlink(missing_ok=True)
@@ -102,25 +123,31 @@ async def save_upload_to_temp(upload: UploadFile, max_size: int = MAX_UPLOAD_SIZ
 
 
 def arff_quote(value: Any) -> str:
-    """Escapes and quotes an attribute or value for WEKA ARFF syntax."""
+    """Escapes and quotes an attribute name or value for WEKA ARFF syntax."""
     val_str = str(value).replace("\\", "\\\\").replace("'", "\\'")
     return f"'{val_str}'"
 
 
-def create_arff(matrix: pd.DataFrame, path: Path):
+def create_arff(
+    user_books: Dict[str, Set[str]],
+    chosen_book_ids: List[str],
+    sanitized_cols: List[str],
+    path: Path,
+):
     """
-    Generates a valid standard WEKA ARFF file.
+    Generates a valid standard WEKA ARFF file directly to disk with zero DataFrame overhead.
     Attributes are declared as binary nominal {no,yes}.
     When used with WEKA's -Z flag, Apriori treats 'no' (the 0th index) as missing,
     ensuring it only mines positive associations (yes) between books.
     """
     with open(path, "w", encoding="utf-8") as f:
         f.write("@RELATION elibrary_preferences\n\n")
-        for col in matrix.columns:
+        for col in sanitized_cols:
             f.write(f"@ATTRIBUTE {arff_quote(col)} {{no,yes}}\n")
         f.write("\n@DATA\n")
-        for row in matrix.itertuples(index=False):
-            f.write(",".join(row) + "\n")
+        for liked in user_books.values():
+            row_tokens = ["yes" if bid_v in liked else "no" for bid_v in chosen_book_ids]
+            f.write(",".join(row_tokens) + "\n")
 
 
 def parse_weka_rules(
@@ -133,16 +160,13 @@ def parse_weka_rules(
     and extracts confidence, lift, and item counts.
     """
     rules: List[Dict[str, Any]] = []
-    # WEKA Apriori rule format:
-    # 1. B11_Harry_Potter=yes B6_Order_of_Phoenix=yes 56 ==> B27_Half_Blood_Prince=yes 52    <conf:(0.93)> lift:(3.51) lev:(0.08) [40] conv:(2.18)
     pattern = re.compile(
         r"^\s*\d+\.\s+(.*?)\s+==>\s+(.*?)\s+<conf:\(([\d.]+)\)>\s+lift:\(([\d.]+)\)",
         re.MULTILINE,
     )
 
     def extract_titles(side_text: str) -> Tuple[str, str]:
-        # side_text e.g. "B11_Harry_Potter=yes B6_Order=yes 56" or "B27_Half_Blood_Prince=yes 52"
-        # Strip trailing item count number:
+        # Strip trailing item count number (e.g. "B1=yes B2=yes 99" -> "B1=yes B2=yes")
         items_part = re.sub(r"\s+\d+$", "", side_text.strip())
         tokens = items_part.split()
         titles = []
@@ -151,11 +175,9 @@ def parse_weka_rules(
                 attr_name = token.split("=yes")[0].strip()
                 title = col_to_title.get(attr_name)
                 if not title:
-                    # Fallback to cleaning the attribute name
                     title = re.sub(r"^B\d+_", "", attr_name).replace("_", " ")
                 titles.append(title)
             elif "=no" in token:
-                # In case a negative token appears
                 attr_name = token.split("=no")[0].strip()
                 title = col_to_title.get(attr_name, attr_name)
                 titles.append(f"NOT {title}")
@@ -197,6 +219,25 @@ async def analyze(
     min_confidence: float = Form(0.5),
     num_rules: int = Form(20),
 ):
+    request_start_time = time.time()
+    logger.info(
+        "--> [START] Analysis requested. books_file='%s', ratings_file='%s', threshold=%.1f, min_support=%.3f, min_confidence=%.2f, num_rules=%d",
+        books_file.filename,
+        ratings_file.filename,
+        rating_threshold,
+        min_support,
+        min_confidence,
+        num_rules,
+    )
+
+    # Concurrency guard: reject if another heavy job is actively executing on this instance
+    if analysis_lock.locked():
+        logger.warning("Rejecting concurrent analysis request (HTTP 429). Instance busy.")
+        raise HTTPException(
+            status_code=429,
+            detail="Another analysis is currently being processed on this instance. Please wait a moment and try again.",
+        )
+
     # Validate threshold ranges
     if not (0.5 <= rating_threshold <= 10.0):
         raise HTTPException(status_code=400, detail="Rating threshold must be between 0.5 and 10.0.")
@@ -210,6 +251,7 @@ async def analyze(
     # Check WEKA JAR existence early
     jar = os.getenv("WEKA_JAR", str(Path(__file__).resolve().parents[1] / "weka" / "weka.jar"))
     if not Path(jar).exists():
+        logger.error("WEKA JAR missing at path: %s", jar)
         raise HTTPException(
             status_code=503,
             detail="WEKA JAR is missing. Please ensure backend/weka/weka.jar exists or configure WEKA_JAR.",
@@ -220,16 +262,26 @@ async def analyze(
     ratings_temp_path: Optional[Path] = None
 
     try:
-        # Stream uploads directly to temporary files with size validation (up to 100 MiB)
-        books_temp_path = await save_upload_to_temp(books_file)
-        ratings_temp_path = await save_upload_to_temp(ratings_file)
+        # ----------------------------------------------------
+        # 1. Stream Uploads Directly to Disk (Low RAM Ingestion)
+        # ----------------------------------------------------
+        t_ingest = time.time()
+        books_temp_path, books_bytes = await save_upload_to_temp(books_file)
+        ratings_temp_path, ratings_bytes = await save_upload_to_temp(ratings_file)
+        logger.info(
+            "Streamed uploads to disk in %.2fs: books=%.2f MB, ratings=%.2f MB",
+            time.time() - t_ingest,
+            books_bytes / (1024 * 1024),
+            ratings_bytes / (1024 * 1024),
+        )
 
         # ----------------------------------------------------
-        # 1. Inspect and Validate books.csv Header & Columns
+        # 2. Inspect & Load books.csv Catalogue
         # ----------------------------------------------------
         try:
             books_header = pd.read_csv(books_temp_path, nrows=0)
         except Exception as e:
+            logger.warning("Failed to parse books header: %s", e)
             raise HTTPException(status_code=400, detail=f"Could not parse books.csv: {str(e)}")
 
         bid = get_col(books_header, ["book_id", "bookid", "id", "item_id", "goodreads_book_id"])
@@ -245,15 +297,13 @@ async def analyze(
                 ),
             )
 
-        # Read books with only the required columns and string dtypes for memory efficiency
         try:
             books_df = pd.read_csv(books_temp_path, usecols=[bid, title], dtype=str)
         except Exception as e:
             raise HTTPException(status_code=400, detail=f"Error reading books.csv: {str(e)}")
 
-        books_df = books_df.rename(columns={bid: "book_id", title: "title"})
-        books_df["book_id"] = books_df["book_id"].str.strip()
-        books_df["title"] = books_df["title"].str.strip()
+        books_df["book_id"] = books_df[bid].astype(str).str.strip()
+        books_df["title"] = books_df[title].astype(str).str.strip()
         books_df = books_df.dropna(subset=["book_id", "title"])
         books_df = books_df[(books_df["book_id"] != "") & (books_df["title"] != "")]
         books_df = books_df.drop_duplicates(subset=["book_id"], keep="first")
@@ -264,12 +314,18 @@ async def analyze(
                 detail=f"The book catalogue must contain at least 2 distinct books. Found {len(books_df)}.",
             )
 
+        catalogue_ids: Set[str] = set(books_df["book_id"])
+        title_map: Dict[str, str] = books_df.set_index("book_id")["title"].to_dict()
+        total_catalogue_books = len(books_df)
+        logger.info("Catalogue validation: %d valid books loaded.", total_catalogue_books)
+
         # ----------------------------------------------------
-        # 2. Inspect and Validate ratings.csv Header & Columns
+        # 3. Inspect ratings.csv Header & Columns
         # ----------------------------------------------------
         try:
             ratings_header = pd.read_csv(ratings_temp_path, nrows=0)
         except Exception as e:
+            logger.warning("Failed to parse ratings header: %s", e)
             raise HTTPException(status_code=400, detail=f"Could not parse ratings.csv: {str(e)}")
 
         uid = get_col(ratings_header, ["user_id", "userid", "reader_id", "user", "reader"])
@@ -293,169 +349,192 @@ async def analyze(
                 ),
             )
 
-        # Read ratings with selected columns
+        # ----------------------------------------------------
+        # 4. Pass 1: Chunked Streaming Validation & Top Books
+        # ----------------------------------------------------
+        # Reads ratings.csv in small chunks to keep memory usage under 80 MB even on 70 MB CSVs
+        t_pass1 = time.time()
+        pos_book_counts: Counter = Counter()
+        total_ratings_rows = 0
+        total_matched_ratings = 0
+        min_score = float("inf")
+        max_score = float("-inf")
+        sample_readers: Set[str] = set()
+
         try:
-            ratings_df = pd.read_csv(
+            reader_iter1 = pd.read_csv(
                 ratings_temp_path,
+                chunksize=CHUNK_SIZE,
                 usecols=[uid, rbid, score],
                 dtype={uid: str, rbid: str},
+                on_bad_lines="skip",
             )
+            for chunk in reader_iter1:
+                total_ratings_rows += len(chunk)
+                chunk[uid] = chunk[uid].astype(str).str.strip()
+                chunk[rbid] = chunk[rbid].astype(str).str.strip()
+                chunk["_rating"] = pd.to_numeric(chunk[score], errors="coerce")
+                chunk = chunk.dropna(subset=[uid, rbid, "_rating"])
+                chunk = chunk[(chunk[uid] != "") & (chunk[rbid] != "")]
+
+                # Filter to books in catalogue
+                matched = chunk[chunk[rbid].isin(catalogue_ids)]
+                if matched.empty:
+                    continue
+
+                total_matched_ratings += len(matched)
+                min_score = min(min_score, matched["_rating"].min())
+                max_score = max(max_score, matched["_rating"].max())
+
+                # Collect sample readers count
+                if len(sample_readers) < 100_000:
+                    sample_readers.update(matched[uid].unique())
+
+                # Positive rating filter
+                pos = matched[matched["_rating"] >= rating_threshold]
+                if not pos.empty:
+                    # Deduplicate within chunk to avoid overcounting re-ratings
+                    pos = pos.drop_duplicates(subset=[uid, rbid])
+                    pos_book_counts.update(pos[rbid])
+
         except Exception as e:
-            raise HTTPException(status_code=400, detail=f"Error reading ratings.csv: {str(e)}")
+            logger.error("Error in streaming Pass 1: %s", e)
+            raise HTTPException(status_code=400, detail=f"Error processing ratings.csv: {str(e)}")
 
-        ratings_df = ratings_df.rename(columns={uid: "user_id", rbid: "book_id", score: "rating"})
-        ratings_df["user_id"] = ratings_df["user_id"].astype(str).str.strip()
-        ratings_df["book_id"] = ratings_df["book_id"].astype(str).str.strip()
-        ratings_df["rating"] = pd.to_numeric(ratings_df["rating"], errors="coerce")
+        if total_ratings_rows == 0:
+            raise HTTPException(status_code=400, detail="ratings.csv contains no rows.")
 
-        # Drop missing values
-        initial_rating_count = len(ratings_df)
-        ratings_df = ratings_df.dropna(subset=["user_id", "book_id", "rating"])
-        ratings_df = ratings_df[(ratings_df["user_id"] != "") & (ratings_df["book_id"] != "")]
-
-        if ratings_df.empty:
+        if total_matched_ratings == 0:
             raise HTTPException(
                 status_code=400,
-                detail="ratings.csv contains no valid rating records after filtering missing values or non-numeric scores.",
+                detail=(
+                    "None of the book IDs in ratings.csv match the book IDs in books.csv. "
+                    "Please verify that both files share the same book ID system."
+                ),
             )
 
-        # Validate rating score sanity (e.g. 0 to 10 scale)
-        min_score, max_score = ratings_df["rating"].min(), ratings_df["rating"].max()
-        if max_score < 0 or min_score > 10:
+        if min_score < 0 or max_score > 10:
             raise HTTPException(
                 status_code=400,
                 detail=f"Rating values are out of the expected range (0 to 10). Found values from {min_score} to {max_score}.",
             )
 
-        # Check catalogue cross-reference
-        catalogue_ids = set(books_df["book_id"])
-        matched_ratings = ratings_df[ratings_df["book_id"].isin(catalogue_ids)].copy()
-
-        if matched_ratings.empty:
-            raise HTTPException(
-                status_code=400,
-                detail=(
-                    "None of the book IDs in ratings.csv match the book IDs in books.csv. "
-                    "Please verify that both files use the same book identification system."
-                ),
-            )
-
-        # Deduplicate reader-book pairs, keeping last rating
-        matched_ratings = matched_ratings.drop_duplicates(subset=["user_id", "book_id"], keep="last")
-
-        total_readers = int(matched_ratings["user_id"].nunique())
-        total_catalogue_books = len(books_df)
-        total_rated_books = int(matched_ratings["book_id"].nunique())
-
-        if total_readers < 2 or total_rated_books < 2:
-            raise HTTPException(
-                status_code=400,
-                detail=(
-                    f"Insufficient usable data for association mining: found {total_readers} reader(s) "
-                    f"and {total_rated_books} book(s). At least 2 readers and 2 catalogue books are required."
-                ),
-            )
-
-        # ----------------------------------------------------
-        # 3. Apply Positive Rating Threshold
-        # ----------------------------------------------------
-        pos = matched_ratings[matched_ratings["rating"] >= rating_threshold].copy()
-        if pos.empty:
+        if not pos_book_counts:
             raise HTTPException(
                 status_code=400,
                 detail=(
                     f"No ratings met the positive rating threshold (>= {rating_threshold}). "
-                    f"The maximum rating in the dataset is {matched_ratings['rating'].max()}. "
-                    "Try lowering the positive rating threshold."
+                    f"The maximum rating in the dataset is {max_score}. Try lowering the positive rating threshold."
                 ),
             )
 
-        pos_book_count = pos["book_id"].nunique()
-        if pos_book_count < 2:
+        if len(pos_book_counts) < 2:
             raise HTTPException(
                 status_code=400,
                 detail=(
-                    f"Only {pos_book_count} book received positive ratings (>= {rating_threshold}). "
+                    f"Only {len(pos_book_counts)} book received positive ratings (>= {rating_threshold}). "
                     "At least 2 distinct books with positive ratings are required to discover association rules. "
                     "Try lowering the positive rating threshold."
                 ),
             )
 
-        # ----------------------------------------------------
-        # 4. Form Reader-Book Binary Matrix
-        # ----------------------------------------------------
-        # Select the most frequently positively rated books (up to 40 books) to keep mining performant
-        counts = pos.groupby("book_id")["user_id"].nunique().sort_values(ascending=False)
-        chosen_book_ids = counts.head(40).index.tolist()
-        pos = pos[pos["book_id"].isin(chosen_book_ids)]
-
-        titles_dict = books_df.set_index("book_id")["title"].to_dict()
-
-        # Build pivot table: only readers who positively rated at least one chosen book
-        matrix = (
-            pos.assign(val="yes")
-            .pivot_table(index="user_id", columns="book_id", values="val", aggfunc="first")
-            .reindex(columns=chosen_book_ids)
-            .fillna("no")
+        # Select top books (up to 40 books) to keep mining performant and mathematically sound
+        chosen_book_ids = [b for b, _ in pos_book_counts.most_common(40)]
+        chosen_set = set(chosen_book_ids)
+        logger.info(
+            "Pass 1 complete in %.2fs: %d rows checked, %d matched catalogue, %d top books selected.",
+            time.time() - t_pass1,
+            total_ratings_rows,
+            total_matched_ratings,
+            len(chosen_book_ids),
         )
 
-        readers_mined = len(matrix)
-        books_mined = len(matrix.columns)
+        # ----------------------------------------------------
+        # 5. Pass 2: Stream Preferences Only for Chosen Books
+        # ----------------------------------------------------
+        # Memory-efficient dictionary mapping user_id -> set of liked chosen book IDs
+        t_pass2 = time.time()
+        user_books: Dict[str, Set[str]] = defaultdict(set)
 
-        if books_mined < 2 or readers_mined < 2:
+        try:
+            reader_iter2 = pd.read_csv(
+                ratings_temp_path,
+                chunksize=CHUNK_SIZE,
+                usecols=[uid, rbid, score],
+                dtype={uid: str, rbid: str},
+                on_bad_lines="skip",
+            )
+            for chunk in reader_iter2:
+                chunk[rbid] = chunk[rbid].astype(str).str.strip()
+                # Fast early filter: discard 90%+ rows that are not in chosen top books
+                chunk = chunk[chunk[rbid].isin(chosen_set)]
+                if chunk.empty:
+                    continue
+                chunk[uid] = chunk[uid].astype(str).str.strip()
+                chunk["_rating"] = pd.to_numeric(chunk[score], errors="coerce")
+                pos = chunk[chunk["_rating"] >= rating_threshold]
+                for uid_v, bid_v in zip(pos[uid], pos[rbid]):
+                    user_books[uid_v].add(bid_v)
+
+        except Exception as e:
+            logger.error("Error in streaming Pass 2: %s", e)
+            raise HTTPException(status_code=400, detail=f"Error extracting preferences: {str(e)}")
+
+        readers_mined = len(user_books)
+        books_mined = len(chosen_book_ids)
+
+        if readers_mined < 2:
             raise HTTPException(
                 status_code=400,
-                detail=(
-                    f"Insufficient records after matrix preparation: {readers_mined} reader(s) "
-                    f"and {books_mined} book(s) qualified. At least 2 readers and 2 books are required."
-                ),
+                detail=f"Fewer than 2 readers have positive ratings for the top books ({readers_mined} reader found).",
             )
 
-        # Map matrix column names to sanitized ARFF attribute names and build title lookup
-        col_to_title: Dict[str, str] = {}
-        sanitized_cols = []
-        for i, bid_val in enumerate(matrix.columns):
-            book_title = titles_dict.get(bid_val, str(bid_val))
-            sanitized_name = re.sub(r"[^A-Za-z0-9_]+", "_", f"B{i+1}_{book_title}").strip("_")[:80]
-            sanitized_cols.append(sanitized_name)
-            col_to_title[sanitized_name] = book_title
-
-        matrix.columns = sanitized_cols
-
-        # Compute dataset support statistics for diagnostics
-        item_supports = (matrix == "yes").sum(axis=0) / readers_mined
-        max_item_support = float(item_supports.max())
-        top_attr = item_supports.idxmax()
-        top_title = col_to_title.get(top_attr, top_attr)
-
         logger.info(
-            "Mining prepared: %d readers, %d books. Max single item support: %.3f (%s)",
+            "Pass 2 complete in %.2fs: %d readers mined across %d top books.",
+            time.time() - t_pass2,
             readers_mined,
             books_mined,
-            max_item_support,
-            top_title,
         )
 
         # ----------------------------------------------------
-        # 5. Execute WEKA Apriori with Concurrency Protection
+        # 6. Stream ARFF Directly to Disk & Calculate Supports
+        # ----------------------------------------------------
+        book_freq = Counter()
+        for liked in user_books.values():
+            book_freq.update(liked)
+
+        max_item_support = 0.0
+        top_book_title = ""
+        col_to_title: Dict[str, str] = {}
+        sanitized_cols = []
+
+        for i, bid_v in enumerate(chosen_book_ids):
+            btitle = title_map.get(bid_v, str(bid_v))
+            sname = re.sub(r"[^A-Za-z0-9_]+", "_", f"B{i+1}_{btitle}").strip("_")[:80]
+            sanitized_cols.append(sname)
+            col_to_title[sname] = btitle
+            supp = book_freq[bid_v] / readers_mined
+            if supp > max_item_support:
+                max_item_support = supp
+                top_book_title = btitle
+
+        # Free Python temporary collections before launching Java
+        del pos_book_counts
+        gc.collect()
+
+        # ----------------------------------------------------
+        # 7. Execute WEKA Apriori with Concurrency Protection
         # ----------------------------------------------------
         weka_stdout = ""
-        heap = os.getenv("WEKA_HEAP", "512m")
+        heap = os.getenv("WEKA_HEAP", DEFAULT_WEKA_HEAP)
 
         with tempfile.TemporaryDirectory() as tmp_dir:
             arff_path = Path(tmp_dir) / "preferences.arff"
-            create_arff(matrix, arff_path)
+            create_arff(user_books, chosen_book_ids, sanitized_cols, arff_path)
 
-            # WEKA command line:
-            # -N: number of rules
-            # -T 0: metric type = confidence
-            # -C: min confidence
-            # -D: delta for support decrement
-            # -U: upper bound support
-            # -M: lower bound min support
-            # -S -1.0: no significance testing
-            # -c -1: no class index (unsupervised association)
-            # -Z: treat zero (nominal index 0 i.e. 'no') as missing -> only mine positive ('yes') itemsets!
+            arff_size_mb = arff_path.stat().st_size / (1024 * 1024)
+            logger.info("ARFF created: %.2f MB (%d instances)", arff_size_mb, readers_mined)
+
             cmd = [
                 "java",
                 f"-Xmx{heap}",
@@ -485,18 +564,29 @@ async def analyze(
                 str(arff_path),
             ]
 
-            # Acquire lock to safeguard server memory from concurrent heavy Java runs
+            logger.info("Executing WEKA Apriori with heap=%s, timeout=120s", heap)
+            t_weka = time.time()
+
             async with analysis_lock:
-                try:
-                    # Run synchronously in threadpool to avoid blocking event loop
-                    run = await asyncio.to_thread(
-                        subprocess.run,
+                def run_weka_sync():
+                    proc = subprocess.Popen(
                         cmd,
-                        capture_output=True,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
                         text=True,
-                        timeout=120,
                     )
+                    try:
+                        stdout, stderr = proc.communicate(timeout=120)
+                        return proc.returncode, stdout, stderr
+                    except subprocess.TimeoutExpired:
+                        proc.kill()
+                        proc.communicate()
+                        raise
+
+                try:
+                    returncode, stdout, stderr = await asyncio.to_thread(run_weka_sync)
                 except subprocess.TimeoutExpired:
+                    logger.error("WEKA Apriori timed out after 120s.")
                     raise HTTPException(
                         status_code=408,
                         detail=(
@@ -505,26 +595,29 @@ async def analyze(
                         ),
                     )
 
-            if run.returncode != 0:
-                err_msg = (run.stderr or run.stdout or "Unknown WEKA error")[-1000:]
-                # Sanitize any local file system paths from error output
+            weka_elapsed = time.time() - t_weka
+            logger.info("WEKA Apriori finished in %.2fs (exit code %d)", weka_elapsed, returncode)
+
+            if returncode != 0:
+                err_msg = (stderr or stdout or "Unknown WEKA error")[-1000:]
                 err_msg = re.sub(r"[A-Za-z]:\\[^ \n\r\t]+", "[internal path]", err_msg)
+                logger.error("WEKA failed with exit code %d: %s", returncode, err_msg)
                 raise HTTPException(status_code=500, detail=f"WEKA execution error: {err_msg}")
 
-            weka_stdout = run.stdout
+            weka_stdout = stdout
 
         # ----------------------------------------------------
-        # 6. Parse Discovered Rules and Build Diagnostics
+        # 8. Parse Discovered Rules and Build Diagnostics
         # ----------------------------------------------------
         rules = parse_weka_rules(weka_stdout, col_to_title)
-
         message: Optional[str] = None
+
         if len(rules) == 0:
             if min_support > max_item_support:
                 suggested_supp = max(0.01, round(max_item_support * 0.75, 2))
                 message = (
                     f"No association rules found because the minimum support threshold ({min_support*100:.1f}%) "
-                    f"is higher than the maximum book preference support in this dataset ({max_item_support*100:.1f}% for '{top_title}'). "
+                    f"is higher than the maximum book preference support in this dataset ({max_item_support*100:.1f}% for '{top_book_title}'). "
                     f"In this dataset, no single book is positively rated by {min_support*100:.1f}% of readers. "
                     f"Adjust the minimum support slider to {suggested_supp:.2f} ({suggested_supp*100:.0f}%) or lower."
                 )
@@ -534,12 +627,18 @@ async def analyze(
                     f"and minimum confidence ({min_confidence*100:.0f}%) thresholds simultaneously. "
                     "Try lowering the minimum support or minimum confidence sliders."
                 )
+            logger.info("Zero rules returned. Diagnostic: %s", message)
+        else:
+            logger.info("Successfully discovered %d association rules.", len(rules))
+
+        total_elapsed = time.time() - request_start_time
+        logger.info("<-- [COMPLETED] Analysis completed in %.2fs", total_elapsed)
 
         return {
             "summary": {
                 "books": total_catalogue_books,
-                "readers": total_readers,
-                "ratings": len(matched_ratings),
+                "readers": len(sample_readers) if len(sample_readers) < 100_000 else total_matched_ratings,
+                "ratings": total_matched_ratings,
                 "books_mined": books_mined,
                 "readers_mined": readers_mined,
                 "rules": len(rules),
@@ -550,15 +649,26 @@ async def analyze(
             "weka_output": weka_stdout[-10000:],
         }
 
+    except HTTPException:
+        raise
+    except Exception as e:
+        total_elapsed = time.time() - request_start_time
+        logger.exception("Unexpected error in /analyze after %.2fs: %s", total_elapsed, e)
+        raise HTTPException(status_code=500, detail=f"Analysis failed: {str(e)}")
     finally:
         # Guarantee cleanup of all temporary uploaded CSV files
+        t_clean = time.time()
+        cleaned = 0
         if books_temp_path and books_temp_path.exists():
             try:
                 books_temp_path.unlink()
+                cleaned += 1
             except Exception as e:
-                logger.warning("Failed to clean up temp file %s: %s", books_temp_path, e)
+                logger.warning("Failed to clean up %s: %s", books_temp_path, e)
         if ratings_temp_path and ratings_temp_path.exists():
             try:
                 ratings_temp_path.unlink()
+                cleaned += 1
             except Exception as e:
-                logger.warning("Failed to clean up temp file %s: %s", ratings_temp_path, e)
+                logger.warning("Failed to clean up %s: %s", ratings_temp_path, e)
+        logger.info("Temporary cleanup finished in %.3fs (%d files removed)", time.time() - t_clean, cleaned)

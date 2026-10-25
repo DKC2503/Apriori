@@ -1,7 +1,22 @@
-node_modules/
-frontend/dist/
-backend/.venv/
-__pycache__/
+# Environment variables and secrets
 .env
-.env.local
-*.pyc
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Node.js
+node_modules/
+dist/
+
+# Logs
+*.log
+
+# IDE and OS files
+.vscode/
+.DS_Store
+Thumbs.db

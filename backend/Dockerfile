@@ -11,5 +11,6 @@ COPY backend/app ./app
 COPY backend/weka ./weka
 
 ENV WEKA_JAR=/app/weka/weka.jar
+ENV WEKA_HEAP=192m
 
 CMD ["sh", "-c", "uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-10000}"]
