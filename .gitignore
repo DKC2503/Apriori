@@ -13,8 +13,11 @@ venv/
 node_modules/
 dist/
 
-# Logs
+# Logs & Caches
 *.log
+*.arff
+.pytest_cache/
+.coverage
 
 # IDE and OS files
 .vscode/

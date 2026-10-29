@@ -2,17 +2,45 @@ import os
 import re
 import gc
 import time
+import uuid
+import hashlib
 import logging
 import tempfile
-import subprocess
 import asyncio
 from pathlib import Path
 from collections import Counter, defaultdict
 from typing import Optional, List, Dict, Any, Tuple, Set
+from contextlib import asynccontextmanager
 
 import pandas as pd
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
+
+from app.database import (
+    init_db,
+    close_db,
+    check_db_health,
+    is_db_connected,
+    get_masked_host,
+)
+from app.db_service import (
+    compute_dataset_version,
+    import_books_from_csv,
+    import_ratings_from_csv,
+    lookup_cached_cluster_model,
+    save_cached_cluster_model,
+    save_cluster_assignments,
+    get_reader_cluster_assignment,
+    get_cluster_details,
+    record_clustering_run,
+    get_analysis_history,
+    clear_cluster_cache,
+    is_dataset_imported,
+    get_dataset_metadata,
+    list_dataset_versions,
+    estimate_storage_requirements,
+)
+from app.kmeans_service import KMeansRecommendationEngine
 
 # Configure structured logging
 logging.basicConfig(
@@ -22,7 +50,26 @@ logging.basicConfig(
 )
 logger = logging.getLogger("elibrary")
 
-app = FastAPI(title="E-Library Recommendation System API")
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """
+    Application lifespan manager.
+    Initializes MongoDB Atlas connection and indexes on startup;
+    closes database connection pool cleanly on shutdown.
+    """
+    logger.info("Starting up: initializing MongoDB Atlas connection...")
+    await asyncio.to_thread(init_db)
+    yield
+    logger.info("Shutting down: closing MongoDB Atlas connection...")
+    await asyncio.to_thread(close_db)
+
+
+app = FastAPI(
+    title="E-Library K-Means Recommendation System API",
+    description="Reader Clustering and Personalized Book Recommendations using Scikit-Learn K-Means and MongoDB Atlas",
+    lifespan=lifespan,
+)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -31,35 +78,125 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Concurrency safeguard: prevent multiple concurrent heavy WEKA analyses from exhausting RAM/CPU
+# Concurrency safeguard: prevent multiple concurrent heavy clustering jobs from exhausting RAM/CPU
 analysis_lock = asyncio.Lock()
+
+# In-flight task coordination: deduplicates simultaneous identical requests while preserving 429 for incompatible analyses
+_in_flight_tasks: Dict[str, asyncio.Future] = {}
+_in_flight_lock = asyncio.Lock()
 
 # 100 MiB maximum upload limit per file
 MAX_UPLOAD_SIZE = 100 * 1024 * 1024  # 100 MiB in bytes
 
-# Default heap for WEKA Java subprocess (192m fits safely in Render's 512 MB free instance)
-DEFAULT_WEKA_HEAP = "192m"
-
 # Number of rows per chunk when reading large CSV files to maintain low memory profile (<100 MB RAM)
-CHUNK_SIZE = 150_000
+CHUNK_SIZE = 250_000
 
+# Active in-memory model state (allows sub-millisecond personalized reader recommendations)
+_active_engine: Optional[KMeansRecommendationEngine] = None
+_active_model_id: Optional[str] = None
+_active_dataset_version: Optional[str] = None
+
+
+# ---------------------------------------------------------------------------
+# Reusable In-Memory Caches
+# ---------------------------------------------------------------------------
+
+class CatalogueCache:
+    """In-memory LRU cache for parsed book catalogues to avoid re-parsing identical books.csv files."""
+    def __init__(self, max_items: int = 5):
+        self.max_items = max_items
+        self._cache: Dict[str, Dict[str, Any]] = {}
+
+    def get(self, key: str) -> Optional[Dict[str, Any]]:
+        return self._cache.get(key)
+
+    def set(self, key: str, value: Dict[str, Any]):
+        if len(self._cache) >= self.max_items:
+            oldest_key = next(iter(self._cache))
+            del self._cache[oldest_key]
+        self._cache[key] = value
+
+
+catalogue_cache = CatalogueCache(max_items=5)
+
+
+# ---------------------------------------------------------------------------
+# API Health and Metadata Endpoints
+# ---------------------------------------------------------------------------
 
 @app.get("/")
 def root():
-    return {"name": "E-Library Recommendation System", "docs": "/docs"}
+    return {
+        "name": "E-Library K-Means Recommendation System",
+        "algorithm": "Scikit-Learn K-Means Reader Clustering",
+        "docs": "/docs",
+        "database": get_masked_host(),
+    }
 
 
 @app.get("/health")
 def health():
-    jar = os.getenv("WEKA_JAR", str(Path(__file__).resolve().parents[1] / "weka" / "weka.jar"))
-    jar_exists = Path(jar).exists()
+    db_status = check_db_health()
     return {
         "status": "ok",
-        "weka_jar_found": jar_exists,
+        "algorithm": "K-Means Reader Clustering (scikit-learn)",
+        "active_model_loaded": _active_engine is not None,
+        "active_dataset_version": _active_dataset_version,
         "max_upload_size_mb": MAX_UPLOAD_SIZE // (1024 * 1024),
-        "weka_heap": os.getenv("WEKA_HEAP", DEFAULT_WEKA_HEAP),
+        "database": db_status,
     }
 
+
+@app.get("/db-health")
+@app.get("/db/status")
+def db_status():
+    """Returns detailed diagnostics of the MongoDB Atlas connection and storage."""
+    return check_db_health()
+
+
+@app.get("/dataset/status")
+def dataset_status():
+    """Returns status of stored dataset metadata, collections, and storage estimates."""
+    db_stat = check_db_health()
+    meta = get_dataset_metadata()
+    versions = list_dataset_versions()
+    storage = estimate_storage_requirements()
+    return {
+        "database_connected": db_stat.get("connected", False),
+        "cluster_host": db_stat.get("cluster_host", "None"),
+        "collections": db_stat.get("collections", {}),
+        "latest_dataset": meta,
+        "dataset_versions": versions,
+        "storage_estimate": storage,
+    }
+
+
+@app.get("/history")
+def history(limit: int = Query(15, ge=1, le=50)):
+    """Returns recent analysis runs audit history from MongoDB."""
+    runs = get_analysis_history(limit=limit)
+    return {"runs": runs, "count": len(runs)}
+
+
+@app.delete("/cache")
+def clear_cache(dataset_version: Optional[str] = None):
+    """Invalidates cached K-Means clustering models and summaries from MongoDB."""
+    global _active_engine, _active_model_id, _active_dataset_version
+    _active_engine = None
+    _active_model_id = None
+    _active_dataset_version = None
+
+    deleted = clear_cluster_cache(dataset_version)
+    return {
+        "status": "ok",
+        "deleted_count": deleted,
+        "message": f"Cleared {deleted} cached K-Means models and in-memory active models.",
+    }
+
+
+# ---------------------------------------------------------------------------
+# CSV Streaming and Upload Helpers
+# ---------------------------------------------------------------------------
 
 def get_col(df: pd.DataFrame, candidates: List[str]) -> Optional[str]:
     """Finds a column matching any of the candidate names case-insensitively."""
@@ -67,54 +204,56 @@ def get_col(df: pd.DataFrame, candidates: List[str]) -> Optional[str]:
     return next((cols[x] for x in candidates if x in cols), None)
 
 
-async def save_upload_to_temp(upload: UploadFile, max_size: int = MAX_UPLOAD_SIZE) -> Tuple[Path, int]:
+async def save_upload_to_temp(upload: UploadFile, max_size: int = MAX_UPLOAD_SIZE) -> Tuple[Path, int, str]:
     """
     Streams an uploaded file directly to a temporary file on disk with chunked reading.
     Validates file extension and ensures total size does not exceed max_size.
-    Avoids loading entire large files into server memory.
-    Returns (temp_path, total_bytes).
+    Computes a fast SHA-256 digest of the first 64 KB for catalogue caching.
     """
     filename = upload.filename or "uploaded_file"
     if not filename.lower().endswith(".csv"):
         raise HTTPException(
             status_code=400,
-            detail=f"Invalid file format for '{filename}'. Only CSV files (.csv) are supported.",
+            detail=f"Only CSV files (.csv) are accepted. Received: '{filename}'.",
         )
 
-    temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".csv")
-    temp_path = Path(temp_file.name)
+    fd, raw_path = tempfile.mkstemp(prefix="elibrary_upload_", suffix=".csv")
+    temp_path = Path(raw_path)
     total_bytes = 0
+    head_hasher = hashlib.sha256()
 
     try:
-        while True:
-            chunk = await upload.read(1024 * 1024)  # 1 MiB chunk
-            if not chunk:
-                break
-            total_bytes += len(chunk)
-            if total_bytes > max_size:
-                temp_file.close()
-                temp_path.unlink(missing_ok=True)
-                raise HTTPException(
-                    status_code=413,
-                    detail=f"File '{filename}' exceeds the 100 MiB upload limit. Maximum allowed size is 100 MiB.",
-                )
-            temp_file.write(chunk)
-        temp_file.close()
+        with os.fdopen(fd, "wb") as temp_file:
+            while True:
+                chunk = await upload.read(64 * 1024)
+                if not chunk:
+                    break
+                total_bytes += len(chunk)
+                if total_bytes <= 65536:
+                    head_hasher.update(chunk)
+                if total_bytes > max_size:
+                    size_mb = total_bytes // (1024 * 1024)
+                    limit_mb = max_size // (1024 * 1024)
+                    raise HTTPException(
+                        status_code=413,
+                        detail=(
+                            f"Uploaded file '{filename}' exceeds the {limit_mb} MiB upload limit. "
+                            f"Current upload reached {size_mb} MiB."
+                        ),
+                    )
+                temp_file.write(chunk)
 
         if total_bytes == 0:
             temp_path.unlink(missing_ok=True)
-            raise HTTPException(
-                status_code=400,
-                detail=f"The uploaded file '{filename}' is empty (0 bytes).",
-            )
+            raise HTTPException(status_code=400, detail=f"The uploaded file '{filename}' is empty.")
 
-        return temp_path, total_bytes
+        head_hash = head_hasher.hexdigest()
+        return temp_path, total_bytes, head_hash
+
     except HTTPException:
-        temp_file.close()
         temp_path.unlink(missing_ok=True)
         raise
     except Exception as e:
-        temp_file.close()
         temp_path.unlink(missing_ok=True)
         raise HTTPException(
             status_code=400,
@@ -122,553 +261,586 @@ async def save_upload_to_temp(upload: UploadFile, max_size: int = MAX_UPLOAD_SIZ
         )
 
 
-def arff_quote(value: Any) -> str:
-    """Escapes and quotes an attribute name or value for WEKA ARFF syntax."""
-    val_str = str(value).replace("\\", "\\\\").replace("'", "\\'")
-    return f"'{val_str}'"
+def load_csv(
+    file_path: Path,
+    required_id_candidates: List[str],
+    required_second_candidates: Optional[List[str]] = None,
+) -> Tuple[pd.DataFrame, str, Optional[str], Optional[str]]:
+    """Loads a small-to-medium CSV and detects required column names with helpful error messages."""
+    try:
+        header_df = pd.read_csv(file_path, nrows=0, on_bad_lines="skip")
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Could not parse CSV header from '{file_path.name}': {str(e)}")
 
-
-def create_arff(
-    user_books: Dict[str, Set[str]],
-    chosen_book_ids: List[str],
-    sanitized_cols: List[str],
-    path: Path,
-):
-    """
-    Generates a valid standard WEKA ARFF file directly to disk with zero DataFrame overhead.
-    Attributes are declared as binary nominal {no,yes}.
-    When used with WEKA's -Z flag, Apriori treats 'no' (the 0th index) as missing,
-    ensuring it only mines positive associations (yes) between books.
-    """
-    with open(path, "w", encoding="utf-8") as f:
-        f.write("@RELATION elibrary_preferences\n\n")
-        for col in sanitized_cols:
-            f.write(f"@ATTRIBUTE {arff_quote(col)} {{no,yes}}\n")
-        f.write("\n@DATA\n")
-        for liked in user_books.values():
-            row_tokens = ["yes" if bid_v in liked else "no" for bid_v in chosen_book_ids]
-            f.write(",".join(row_tokens) + "\n")
-
-
-def parse_weka_rules(
-    weka_stdout: str,
-    col_to_title: Dict[str, str],
-) -> List[Dict[str, Any]]:
-    """
-    Parses association rules from WEKA Apriori stdout.
-    Handles single and multi-item antecedents, cleans book titles,
-    and extracts confidence, lift, and item counts.
-    """
-    rules: List[Dict[str, Any]] = []
-    pattern = re.compile(
-        r"^\s*\d+\.\s+(.*?)\s+==>\s+(.*?)\s+<conf:\(([\d.]+)\)>\s+lift:\(([\d.]+)\)",
-        re.MULTILINE,
-    )
-
-    def extract_titles(side_text: str) -> Tuple[str, str]:
-        # Strip trailing item count number (e.g. "B1=yes B2=yes 99" -> "B1=yes B2=yes")
-        items_part = re.sub(r"\s+\d+$", "", side_text.strip())
-        tokens = items_part.split()
-        titles = []
-        for token in tokens:
-            if "=yes" in token:
-                attr_name = token.split("=yes")[0].strip()
-                title = col_to_title.get(attr_name)
-                if not title:
-                    title = re.sub(r"^B\d+_", "", attr_name).replace("_", " ")
-                titles.append(title)
-            elif "=no" in token:
-                attr_name = token.split("=no")[0].strip()
-                title = col_to_title.get(attr_name, attr_name)
-                titles.append(f"NOT {title}")
-        clean_title = " + ".join(titles) if titles else items_part
-        return clean_title, side_text.strip()
-
-    for match in pattern.finditer(weka_stdout):
-        lhs_raw, rhs_raw, conf_str, lift_str = match.groups()
-
-        # Only retain rules that represent positive preferences
-        if "=no" in lhs_raw or "=no" in rhs_raw:
-            continue
-        if "=yes" not in lhs_raw or "=yes" not in rhs_raw:
-            continue
-
-        antecedent_title, antecedent_expr = extract_titles(lhs_raw)
-        consequent_title, consequent_expr = extract_titles(rhs_raw)
-
-        rules.append(
-            {
-                "antecedent_title": antecedent_title,
-                "consequent_title": consequent_title,
-                "confidence": round(float(conf_str), 4),
-                "lift": round(float(lift_str), 2),
-                "antecedent": antecedent_expr,
-                "consequent": consequent_expr,
-            }
+    id_col = get_col(header_df, required_id_candidates)
+    if not id_col:
+        found = list(header_df.columns)
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"'{file_path.name}' is missing required ID column. "
+                f"Expected one of {required_id_candidates}, found: {found}."
+            ),
         )
 
-    return rules
+    second_col = None
+    if required_second_candidates:
+        second_col = get_col(header_df, required_second_candidates)
+        if not second_col:
+            found = list(header_df.columns)
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"'{file_path.name}' is missing required secondary column. "
+                    f"Expected one of {required_second_candidates}, found: {found}."
+                ),
+            )
 
+    usecols = [id_col]
+    if second_col:
+        usecols.append(second_col)
+
+    try:
+        df = pd.read_csv(file_path, usecols=usecols, on_bad_lines="skip")
+        return df, id_col, second_col, None
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Error reading CSV content: {str(e)}")
+
+
+# ---------------------------------------------------------------------------
+# Core Analysis Endpoint: K-Means Reader Clustering
+# ---------------------------------------------------------------------------
 
 @app.post("/analyze")
+@app.post("/cluster")
 async def analyze(
     books_file: UploadFile = File(...),
     ratings_file: UploadFile = File(...),
-    rating_threshold: float = Form(4.0),
-    min_support: float = Form(0.05),
-    min_confidence: float = Form(0.5),
-    num_rules: int = Form(20),
+    n_clusters: int = Form(5),
+    rating_threshold: float = Form(3.0),
+    random_state: int = Form(42),
+    algorithm: str = Form("minibatch_kmeans"),
+    # Compatibility arguments for older clients
+    min_support: Optional[float] = Form(None),
+    min_confidence: Optional[float] = Form(None),
+    num_rules: Optional[int] = Form(None),
 ):
-    request_start_time = time.time()
+    """
+    Primary K-Means Reader Clustering Endpoint.
+    1. Validates inputs & checks MongoDB cluster cache (returning in ~0.02s on HIT).
+    2. Streams ratings.csv in low-memory chunks, vectorizing reader profiles into sparse matrix.
+    3. Performs TruncatedSVD dimensionality reduction & Scikit-Learn K-Means reader clustering.
+    4. Computes genuine mathematical inertia, iterations, and Bayesian cluster rankings.
+    5. Persists model and bucketed reader assignments to MongoDB Atlas.
+    """
+    global _active_engine, _active_model_id, _active_dataset_version
+    request_start_time = time.perf_counter()
     logger.info(
-        "--> [START] Analysis requested. books_file='%s', ratings_file='%s', threshold=%.1f, min_support=%.3f, min_confidence=%.2f, num_rules=%d",
-        books_file.filename,
-        ratings_file.filename,
+        "--> [START] K-Means Clustering request: k=%d, threshold=%.1f, seed=%d, algo=%s",
+        n_clusters,
         rating_threshold,
-        min_support,
-        min_confidence,
-        num_rules,
+        random_state,
+        algorithm,
     )
 
-    # Concurrency guard: reject if another heavy job is actively executing on this instance
-    if analysis_lock.locked():
-        logger.warning("Rejecting concurrent analysis request (HTTP 429). Instance busy.")
-        raise HTTPException(
-            status_code=429,
-            detail="Another analysis is currently being processed on this instance. Please wait a moment and try again.",
-        )
-
-    # Validate threshold ranges
+    # Validation
+    if not (2 <= n_clusters <= 50):
+        raise HTTPException(status_code=400, detail="Number of clusters (k) must be between 2 and 50.")
     if not (0.5 <= rating_threshold <= 10.0):
         raise HTTPException(status_code=400, detail="Rating threshold must be between 0.5 and 10.0.")
-    if not (0.001 <= min_support <= 1.0):
-        raise HTTPException(status_code=400, detail="Minimum support must be between 0.001 and 1.0.")
-    if not (0.01 <= min_confidence <= 1.0):
-        raise HTTPException(status_code=400, detail="Minimum confidence must be between 0.01 and 1.0.")
-    if not (1 <= num_rules <= 100):
-        raise HTTPException(status_code=400, detail="Number of rules must be between 1 and 100.")
 
-    # Check WEKA JAR existence early
-    jar = os.getenv("WEKA_JAR", str(Path(__file__).resolve().parents[1] / "weka" / "weka.jar"))
-    if not Path(jar).exists():
-        logger.error("WEKA JAR missing at path: %s", jar)
-        raise HTTPException(
-            status_code=503,
-            detail="WEKA JAR is missing. Please ensure backend/weka/weka.jar exists or configure WEKA_JAR.",
-        )
-
-    # Temporary files to be cleaned up guaranteed in finally block
     books_temp_path: Optional[Path] = None
     ratings_temp_path: Optional[Path] = None
+    task_key: Optional[str] = None
+    is_leader = False
 
     try:
-        # ----------------------------------------------------
-        # 1. Stream Uploads Directly to Disk (Low RAM Ingestion)
-        # ----------------------------------------------------
-        t_ingest = time.time()
-        books_temp_path, books_bytes = await save_upload_to_temp(books_file)
-        ratings_temp_path, ratings_bytes = await save_upload_to_temp(ratings_file)
-        logger.info(
-            "Streamed uploads to disk in %.2fs: books=%.2f MB, ratings=%.2f MB",
-            time.time() - t_ingest,
-            books_bytes / (1024 * 1024),
-            ratings_bytes / (1024 * 1024),
+        # 1. Stream Uploads Directly to Disk
+        t0 = time.perf_counter()
+        books_temp_path, books_bytes, books_hash = await save_upload_to_temp(books_file)
+        ratings_temp_path, ratings_bytes, _ = await save_upload_to_temp(ratings_file)
+        t_ingest = time.perf_counter() - t0
+
+        orig_b = getattr(books_file, "filename", None) or "books.csv"
+        orig_r = getattr(ratings_file, "filename", None) or "ratings.csv"
+        dataset_version = compute_dataset_version(books_temp_path, ratings_temp_path, original_names=[orig_b, orig_r])
+        logger.info("Dataset version fingerprint: [%s]", dataset_version)
+
+        algo_norm = algorithm.strip().lower()
+        task_key = f"{dataset_version}:{n_clusters}:{rating_threshold:.2f}:{random_state}:{algo_norm}"
+
+        # 2. Check MongoDB Persistent Cluster Cache (Tier 1 Instant Hit)
+        cached_model = await asyncio.to_thread(
+            lookup_cached_cluster_model,
+            dataset_version=dataset_version,
+            n_clusters=n_clusters,
+            rating_threshold=rating_threshold,
+            random_state=random_state,
+            algorithm=algo_norm,
         )
+        if cached_model:
+            total_elapsed = round(time.perf_counter() - request_start_time, 4)
+            cached_model["timing"]["total_seconds"] = total_elapsed
+            logger.info("<-- [CACHE HIT] Returning K-Means clustering in %.4fs from MongoDB cache", total_elapsed)
 
-        # ----------------------------------------------------
-        # 2. Inspect & Load books.csv Catalogue
-        # ----------------------------------------------------
-        try:
-            books_header = pd.read_csv(books_temp_path, nrows=0)
-        except Exception as e:
-            logger.warning("Failed to parse books header: %s", e)
-            raise HTTPException(status_code=400, detail=f"Could not parse books.csv: {str(e)}")
-
-        bid = get_col(books_header, ["book_id", "bookid", "id", "item_id", "goodreads_book_id"])
-        title = get_col(books_header, ["title", "book_title", "name", "original_title"])
-
-        if not bid or not title:
-            found_cols = list(books_header.columns)
-            raise HTTPException(
-                status_code=400,
-                detail=(
-                    f"books.csv is missing required columns. Found: {found_cols}. "
-                    "Required: a book ID column ('book_id', 'bookid', or 'id') and a title column ('title', 'book_title', or 'name')."
-                ),
+            # Restore active model state for instant subsequent /recommend and /clusters queries
+            _active_model_id = cached_model.get("model_id")
+            _active_dataset_version = dataset_version
+            reconstructed_engine = KMeansRecommendationEngine(
+                n_clusters=n_clusters,
+                rating_threshold=rating_threshold,
+                random_state=random_state,
+                algorithm=algo_norm,
             )
+            reconstructed_engine.cluster_sizes = cached_model.get("metrics", {}).get("cluster_sizes", {})
+            reconstructed_engine.metrics = cached_model.get("metrics", {})
+            reconstructed_engine._cached_summaries = cached_model.get("clusters", [])
+            reconstructed_engine.n_clusters = len(cached_model.get("clusters", [])) or n_clusters
+            _active_engine = reconstructed_engine
 
-        try:
-            books_df = pd.read_csv(books_temp_path, usecols=[bid, title], dtype=str)
-        except Exception as e:
-            raise HTTPException(status_code=400, detail=f"Error reading books.csv: {str(e)}")
-
-        books_df["book_id"] = books_df[bid].astype(str).str.strip()
-        books_df["title"] = books_df[title].astype(str).str.strip()
-        books_df = books_df.dropna(subset=["book_id", "title"])
-        books_df = books_df[(books_df["book_id"] != "") & (books_df["title"] != "")]
-        books_df = books_df.drop_duplicates(subset=["book_id"], keep="first")
-
-        if len(books_df) < 2:
-            raise HTTPException(
-                status_code=400,
-                detail=f"The book catalogue must contain at least 2 distinct books. Found {len(books_df)}.",
+            await asyncio.to_thread(
+                record_clustering_run,
+                dataset_version=dataset_version,
+                n_clusters=n_clusters,
+                rating_threshold=rating_threshold,
+                algorithm=algo_norm,
+                inertia=cached_model.get("metrics", {}).get("inertia", 0.0),
+                usable_readers=cached_model.get("summary", {}).get("usable_readers", 0),
+                usable_books=cached_model.get("summary", {}).get("usable_books", 0),
+                total_seconds=total_elapsed,
+                source="mongodb_cluster_cache",
+                cache_hit=True,
             )
+            return cached_model
 
-        catalogue_ids: Set[str] = set(books_df["book_id"])
-        title_map: Dict[str, str] = books_df.set_index("book_id")["title"].to_dict()
-        total_catalogue_books = len(books_df)
-        logger.info("Catalogue validation: %d valid books loaded.", total_catalogue_books)
+        # 3. Concurrency Safeguard & In-Flight Duplicate Reuse
+        async with _in_flight_lock:
+            if task_key in _in_flight_tasks:
+                logger.info("[CONCURRENCY] Identical analysis in progress for key [%s]. Awaiting existing task...", task_key)
+                existing_fut = _in_flight_tasks[task_key]
+            elif len(_in_flight_tasks) > 0 or analysis_lock.locked():
+                logger.warning("Rejecting concurrent incompatible analysis request (HTTP 429). Instance busy.")
+                raise HTTPException(
+                    status_code=429,
+                    detail="Another clustering analysis is currently being processed on this instance. Please wait a moment and try again.",
+                )
+            else:
+                leader_fut = asyncio.get_running_loop().create_future()
+                _in_flight_tasks[task_key] = leader_fut
+                is_leader = True
 
-        # ----------------------------------------------------
-        # 3. Inspect ratings.csv Header & Columns
-        # ----------------------------------------------------
-        try:
-            ratings_header = pd.read_csv(ratings_temp_path, nrows=0)
-        except Exception as e:
-            logger.warning("Failed to parse ratings header: %s", e)
-            raise HTTPException(status_code=400, detail=f"Could not parse ratings.csv: {str(e)}")
+        if not is_leader:
+            try:
+                leader_result = await asyncio.wait_for(asyncio.shield(existing_fut), timeout=120.0)
+                total_elapsed = round(time.perf_counter() - request_start_time, 4)
+                follower_result = dict(leader_result)
+                follower_result["timing"] = dict(leader_result.get("timing", {}))
+                follower_result["timing"]["total_seconds"] = total_elapsed
+                follower_result["timing"]["source"] = "concurrent_in_flight_reuse"
+                logger.info("<-- [CONCURRENT REUSE] Safely reused in-flight clustering result for [%s] in %.4fs", task_key, total_elapsed)
+                return follower_result
+            except asyncio.TimeoutError:
+                logger.error("Timed out waiting for concurrent analysis [%s] after 120s", task_key)
+                raise HTTPException(status_code=504, detail="Clustering analysis timed out while waiting for existing in-flight task.")
 
-        uid = get_col(ratings_header, ["user_id", "userid", "reader_id", "user", "reader"])
-        rbid = get_col(ratings_header, ["book_id", "bookid", "item_id", "book"])
-        score = get_col(ratings_header, ["rating", "score", "user_rating", "stars"])
-
-        if not all([uid, rbid, score]):
-            found_cols = list(ratings_header.columns)
-            missing = []
-            if not uid:
-                missing.append("user_id")
-            if not rbid:
-                missing.append("book_id")
-            if not score:
-                missing.append("rating")
-            raise HTTPException(
-                status_code=400,
-                detail=(
-                    f"ratings.csv is missing required columns ({', '.join(missing)}). "
-                    f"Found columns: {found_cols}. Required: user_id, book_id, rating."
-                ),
-            )
-
-        # ----------------------------------------------------
-        # 4. Pass 1: Chunked Streaming Validation & Top Books
-        # ----------------------------------------------------
-        # Reads ratings.csv in small chunks to keep memory usage under 80 MB even on 70 MB CSVs
-        t_pass1 = time.time()
-        pos_book_counts: Counter = Counter()
-        total_ratings_rows = 0
-        total_matched_ratings = 0
-        min_score = float("inf")
-        max_score = float("-inf")
-        sample_readers: Set[str] = set()
-
-        try:
-            reader_iter1 = pd.read_csv(
-                ratings_temp_path,
-                chunksize=CHUNK_SIZE,
-                usecols=[uid, rbid, score],
-                dtype={uid: str, rbid: str},
-                on_bad_lines="skip",
-            )
-            for chunk in reader_iter1:
-                total_ratings_rows += len(chunk)
-                chunk[uid] = chunk[uid].astype(str).str.strip()
-                chunk[rbid] = chunk[rbid].astype(str).str.strip()
-                chunk["_rating"] = pd.to_numeric(chunk[score], errors="coerce")
-                chunk = chunk.dropna(subset=[uid, rbid, "_rating"])
-                chunk = chunk[(chunk[uid] != "") & (chunk[rbid] != "")]
-
-                # Filter to books in catalogue
-                matched = chunk[chunk[rbid].isin(catalogue_ids)]
-                if matched.empty:
-                    continue
-
-                total_matched_ratings += len(matched)
-                min_score = min(min_score, matched["_rating"].min())
-                max_score = max(max_score, matched["_rating"].max())
-
-                # Collect sample readers count
-                if len(sample_readers) < 100_000:
-                    sample_readers.update(matched[uid].unique())
-
-                # Positive rating filter
-                pos = matched[matched["_rating"] >= rating_threshold]
-                if not pos.empty:
-                    # Deduplicate within chunk to avoid overcounting re-ratings
-                    pos = pos.drop_duplicates(subset=[uid, rbid])
-                    pos_book_counts.update(pos[rbid])
-
-        except Exception as e:
-            logger.error("Error in streaming Pass 1: %s", e)
-            raise HTTPException(status_code=400, detail=f"Error processing ratings.csv: {str(e)}")
-
-        if total_ratings_rows == 0:
-            raise HTTPException(status_code=400, detail="ratings.csv contains no rows.")
-
-        if total_matched_ratings == 0:
-            raise HTTPException(
-                status_code=400,
-                detail=(
-                    "None of the book IDs in ratings.csv match the book IDs in books.csv. "
-                    "Please verify that both files share the same book ID system."
-                ),
-            )
-
-        if min_score < 0 or max_score > 10:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Rating values are out of the expected range (0 to 10). Found values from {min_score} to {max_score}.",
-            )
-
-        if not pos_book_counts:
-            raise HTTPException(
-                status_code=400,
-                detail=(
-                    f"No ratings met the positive rating threshold (>= {rating_threshold}). "
-                    f"The maximum rating in the dataset is {max_score}. Try lowering the positive rating threshold."
-                ),
-            )
-
-        if len(pos_book_counts) < 2:
-            raise HTTPException(
-                status_code=400,
-                detail=(
-                    f"Only {len(pos_book_counts)} book received positive ratings (>= {rating_threshold}). "
-                    "At least 2 distinct books with positive ratings are required to discover association rules. "
-                    "Try lowering the positive rating threshold."
-                ),
-            )
-
-        # Select top books (up to 40 books) to keep mining performant and mathematically sound
-        chosen_book_ids = [b for b, _ in pos_book_counts.most_common(40)]
-        chosen_set = set(chosen_book_ids)
-        logger.info(
-            "Pass 1 complete in %.2fs: %d rows checked, %d matched catalogue, %d top books selected.",
-            time.time() - t_pass1,
-            total_ratings_rows,
-            total_matched_ratings,
-            len(chosen_book_ids),
-        )
-
-        # ----------------------------------------------------
-        # 5. Pass 2: Stream Preferences Only for Chosen Books
-        # ----------------------------------------------------
-        # Memory-efficient dictionary mapping user_id -> set of liked chosen book IDs
-        t_pass2 = time.time()
-        user_books: Dict[str, Set[str]] = defaultdict(set)
-
-        try:
-            reader_iter2 = pd.read_csv(
-                ratings_temp_path,
-                chunksize=CHUNK_SIZE,
-                usecols=[uid, rbid, score],
-                dtype={uid: str, rbid: str},
-                on_bad_lines="skip",
-            )
-            for chunk in reader_iter2:
-                chunk[rbid] = chunk[rbid].astype(str).str.strip()
-                # Fast early filter: discard 90%+ rows that are not in chosen top books
-                chunk = chunk[chunk[rbid].isin(chosen_set)]
-                if chunk.empty:
-                    continue
-                chunk[uid] = chunk[uid].astype(str).str.strip()
-                chunk["_rating"] = pd.to_numeric(chunk[score], errors="coerce")
-                pos = chunk[chunk["_rating"] >= rating_threshold]
-                for uid_v, bid_v in zip(pos[uid], pos[rbid]):
-                    user_books[uid_v].add(bid_v)
-
-        except Exception as e:
-            logger.error("Error in streaming Pass 2: %s", e)
-            raise HTTPException(status_code=400, detail=f"Error extracting preferences: {str(e)}")
-
-        readers_mined = len(user_books)
-        books_mined = len(chosen_book_ids)
-
-        if readers_mined < 2:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Fewer than 2 readers have positive ratings for the top books ({readers_mined} reader found).",
-            )
-
-        logger.info(
-            "Pass 2 complete in %.2fs: %d readers mined across %d top books.",
-            time.time() - t_pass2,
-            readers_mined,
-            books_mined,
-        )
-
-        # ----------------------------------------------------
-        # 6. Stream ARFF Directly to Disk & Calculate Supports
-        # ----------------------------------------------------
-        book_freq = Counter()
-        for liked in user_books.values():
-            book_freq.update(liked)
-
-        max_item_support = 0.0
-        top_book_title = ""
-        col_to_title: Dict[str, str] = {}
-        sanitized_cols = []
-
-        for i, bid_v in enumerate(chosen_book_ids):
-            btitle = title_map.get(bid_v, str(bid_v))
-            sname = re.sub(r"[^A-Za-z0-9_]+", "_", f"B{i+1}_{btitle}").strip("_")[:80]
-            sanitized_cols.append(sname)
-            col_to_title[sname] = btitle
-            supp = book_freq[bid_v] / readers_mined
-            if supp > max_item_support:
-                max_item_support = supp
-                top_book_title = btitle
-
-        # Free Python temporary collections before launching Java
-        del pos_book_counts
-        gc.collect()
-
-        # ----------------------------------------------------
-        # 7. Execute WEKA Apriori with Concurrency Protection
-        # ----------------------------------------------------
-        weka_stdout = ""
-        heap = os.getenv("WEKA_HEAP", DEFAULT_WEKA_HEAP)
-
-        with tempfile.TemporaryDirectory() as tmp_dir:
-            arff_path = Path(tmp_dir) / "preferences.arff"
-            create_arff(user_books, chosen_book_ids, sanitized_cols, arff_path)
-
-            arff_size_mb = arff_path.stat().st_size / (1024 * 1024)
-            logger.info("ARFF created: %.2f MB (%d instances)", arff_size_mb, readers_mined)
-
-            cmd = [
-                "java",
-                f"-Xmx{heap}",
-                "--add-opens",
-                "java.base/java.lang=ALL-UNNAMED",
-                "-cp",
-                jar,
-                "weka.associations.Apriori",
-                "-N",
-                str(num_rules),
-                "-T",
-                "0",
-                "-C",
-                str(min_confidence),
-                "-D",
-                "0.05",
-                "-U",
-                "1.0",
-                "-M",
-                str(min_support),
-                "-S",
-                "-1.0",
-                "-c",
-                "-1",
-                "-Z",
-                "-t",
-                str(arff_path),
-            ]
-
-            logger.info("Executing WEKA Apriori with heap=%s, timeout=120s", heap)
-            t_weka = time.time()
-
-            async with analysis_lock:
-                def run_weka_sync():
-                    proc = subprocess.Popen(
-                        cmd,
-                        stdout=subprocess.PIPE,
-                        stderr=subprocess.PIPE,
-                        text=True,
-                    )
-                    try:
-                        stdout, stderr = proc.communicate(timeout=120)
-                        return proc.returncode, stdout, stderr
-                    except subprocess.TimeoutExpired:
-                        proc.kill()
-                        proc.communicate()
-                        raise
-
+        # 4. Parse Books Catalogue & Metadata (Leader Execution)
+        async with analysis_lock:
+            t0 = time.perf_counter()
+            cached_cat = catalogue_cache.get(books_hash)
+            if cached_cat:
+                catalogue_ids = cached_cat["catalogue_ids"]
+                title_map = cached_cat["title_map"]
+                book_metadata = cached_cat["book_metadata"]
+                total_catalogue_books = cached_cat["total_books"]
+            else:
                 try:
-                    returncode, stdout, stderr = await asyncio.to_thread(run_weka_sync)
-                except subprocess.TimeoutExpired:
-                    logger.error("WEKA Apriori timed out after 120s.")
+                    books_df = pd.read_csv(books_temp_path, on_bad_lines="skip")
+                except Exception as e:
+                    raise HTTPException(status_code=400, detail=f"Could not parse books.csv: {str(e)}")
+
+                cols_lower = {str(c).strip().lower(): c for c in books_df.columns}
+                bid_col = cols_lower.get("book_id") or cols_lower.get("id") or cols_lower.get("isbn")
+                title_col = cols_lower.get("title") or cols_lower.get("book_title") or cols_lower.get("name")
+
+                if not bid_col or not title_col:
+                    found_cols = list(books_df.columns)
                     raise HTTPException(
-                        status_code=408,
+                        status_code=400,
                         detail=(
-                            "WEKA Apriori timed out after 120 seconds. The dataset or parameter combinations "
-                            "may require too much search time. Try increasing minimum support or rating threshold."
+                            f"books.csv is missing required columns. Found: {found_cols}. "
+                            "Required: a book ID column ('book_id') and a title column ('title')."
                         ),
                     )
 
-            weka_elapsed = time.time() - t_weka
-            logger.info("WEKA Apriori finished in %.2fs (exit code %d)", weka_elapsed, returncode)
+                books_df["book_id"] = books_df[bid_col].astype(str).str.strip()
+                books_df["title"] = books_df[title_col].astype(str).str.strip()
+                books_df = books_df.dropna(subset=["book_id", "title"])
+                books_df = books_df[(books_df["book_id"] != "") & (books_df["title"] != "")]
+                books_df = books_df.drop_duplicates(subset=["book_id"], keep="first")
 
-            if returncode != 0:
-                err_msg = (stderr or stdout or "Unknown WEKA error")[-1000:]
-                err_msg = re.sub(r"[A-Za-z]:\\[^ \n\r\t]+", "[internal path]", err_msg)
-                logger.error("WEKA failed with exit code %d: %s", returncode, err_msg)
-                raise HTTPException(status_code=500, detail=f"WEKA execution error: {err_msg}")
+                if len(books_df) < 2:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"The book catalogue must contain at least 2 distinct books. Found {len(books_df)}.",
+                    )
 
-            weka_stdout = stdout
+                author_col = cols_lower.get("authors") or cols_lower.get("author")
+                img_col = cols_lower.get("image_url") or cols_lower.get("small_image_url")
 
-        # ----------------------------------------------------
-        # 8. Parse Discovered Rules and Build Diagnostics
-        # ----------------------------------------------------
-        rules = parse_weka_rules(weka_stdout, col_to_title)
-        message: Optional[str] = None
+                title_map = dict(zip(books_df["book_id"], books_df["title"]))
+                catalogue_ids = set(title_map.keys())
+                total_catalogue_books = len(title_map)
 
-        if len(rules) == 0:
-            if min_support > max_item_support:
-                suggested_supp = max(0.01, round(max_item_support * 0.75, 2))
-                message = (
-                    f"No association rules found because the minimum support threshold ({min_support*100:.1f}%) "
-                    f"is higher than the maximum book preference support in this dataset ({max_item_support*100:.1f}% for '{top_book_title}'). "
-                    f"In this dataset, no single book is positively rated by {min_support*100:.1f}% of readers. "
-                    f"Adjust the minimum support slider to {suggested_supp:.2f} ({suggested_supp*100:.0f}%) or lower."
+                book_metadata = {}
+                for row in books_df.itertuples(index=False):
+                    r_dict = row._asdict() if hasattr(row, "_asdict") else dict(zip(books_df.columns, row))
+                    b_id = str(r_dict["book_id"]).strip()
+                    book_metadata[b_id] = {
+                        "book_id": b_id,
+                        "title": str(r_dict["title"]).strip(),
+                        "authors": str(r_dict.get(author_col, "Unknown")).strip() if author_col and pd.notna(r_dict.get(author_col)) else "Unknown",
+                        "image_url": str(r_dict.get(img_col, "")).strip() if img_col and pd.notna(r_dict.get(img_col)) else "",
+                    }
+
+                catalogue_cache.set(
+                    books_hash,
+                    {
+                        "catalogue_ids": catalogue_ids,
+                        "title_map": title_map,
+                        "book_metadata": book_metadata,
+                        "total_books": total_catalogue_books,
+                    },
                 )
-            else:
-                message = (
-                    f"No association rules satisfied both the minimum support ({min_support*100:.1f}%) "
-                    f"and minimum confidence ({min_confidence*100:.0f}%) thresholds simultaneously. "
-                    "Try lowering the minimum support or minimum confidence sliders."
+
+            t_catalogue = time.perf_counter() - t0
+
+            # 5. Check ratings.csv Header & Columns
+            try:
+                ratings_header = pd.read_csv(ratings_temp_path, nrows=0, on_bad_lines="skip")
+            except Exception as e:
+                raise HTTPException(status_code=400, detail=f"Could not parse ratings.csv: {str(e)}")
+
+            uid = get_col(ratings_header, ["user_id", "userid", "reader_id", "user", "reader"])
+            rbid = get_col(ratings_header, ["book_id", "bookid", "item_id", "book"])
+            score = get_col(ratings_header, ["rating", "score", "user_rating", "stars"])
+
+            if not all([uid, rbid, score]):
+                found_cols = list(ratings_header.columns)
+                missing = [c for c, present in [("user_id", uid), ("book_id", rbid), ("rating", score)] if not present]
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"ratings.csv is missing required columns ({', '.join(missing)}). Found columns: {found_cols}.",
                 )
-            logger.info("Zero rules returned. Diagnostic: %s", message)
-        else:
-            logger.info("Successfully discovered %d association rules.", len(rules))
 
-        total_elapsed = time.time() - request_start_time
-        logger.info("<-- [COMPLETED] Analysis completed in %.2fs", total_elapsed)
+            # 6. Execute Mathematical Feature Extraction & K-Means Engine
+            engine = KMeansRecommendationEngine(
+                n_clusters=n_clusters,
+                rating_threshold=rating_threshold,
+                random_state=random_state,
+                algorithm=algo_norm,
+            )
 
-        return {
-            "summary": {
-                "books": total_catalogue_books,
-                "readers": len(sample_readers) if len(sample_readers) < 100_000 else total_matched_ratings,
-                "ratings": total_matched_ratings,
-                "books_mined": books_mined,
-                "readers_mined": readers_mined,
-                "rules": len(rules),
-                "max_item_support": round(max_item_support, 4),
-            },
-            "rules": rules,
-            "message": message,
-            "weka_output": weka_stdout[-10000:],
-        }
+            t0_features = time.perf_counter()
+            try:
+                sparse_features, reader_ids, feature_book_ids = await asyncio.to_thread(
+                    engine.extract_features_from_csv,
+                    ratings_path=ratings_temp_path,
+                    catalogue_ids=catalogue_ids,
+                    chunk_size=CHUNK_SIZE,
+                )
+            except ValueError as ve:
+                raise HTTPException(status_code=400, detail=str(ve))
+            t_features = time.perf_counter() - t0_features
 
-    except HTTPException:
+            t0_cluster = time.perf_counter()
+            metrics = await asyncio.to_thread(
+                engine.fit,
+                sparse_features=sparse_features,
+                title_map=title_map,
+                book_metadata=book_metadata,
+            )
+            t_clustering = time.perf_counter() - t0_cluster
+
+            # 7. Generate Cluster Summaries & Sample Recommendations
+            cluster_summaries = engine.get_cluster_summaries(top_n_books=6)
+            sample_reader = reader_ids[0] if reader_ids else "1"
+            sample_recs = engine.recommend_for_reader(sample_reader, n_recommendations=6)
+
+            model_id = f"km_{uuid.uuid4().hex[:10]}"
+            total_elapsed = round(time.perf_counter() - request_start_time, 3)
+
+            summary_info = {
+                "total_catalogue_books": total_catalogue_books,
+                "usable_readers": len(reader_ids),
+                "usable_books": len(feature_book_ids),
+                "n_clusters": engine.n_clusters,
+                "inertia": metrics["inertia"],
+                "iterations": metrics["n_iter"],
+                "explained_variance_ratio": metrics["explained_variance_ratio"],
+                "algorithm": metrics["algorithm_used"],
+            }
+
+            timing_info = {
+                "total_seconds": total_elapsed,
+                "ingest_seconds": round(t_ingest, 3),
+                "catalogue_seconds": round(t_catalogue, 3),
+                "feature_extraction_seconds": round(t_features, 3),
+                "clustering_seconds": round(t_clustering, 3),
+                "cache_hit": False,
+                "source": "fresh_kmeans_computation",
+            }
+
+            # 8. Persist to MongoDB Atlas
+            if is_db_connected():
+                await asyncio.to_thread(
+                    import_books_from_csv,
+                    books_path=books_temp_path,
+                )
+                save_ok = await asyncio.to_thread(
+                    save_cached_cluster_model,
+                    dataset_version=dataset_version,
+                    n_clusters=engine.n_clusters,
+                    rating_threshold=rating_threshold,
+                    random_state=random_state,
+                    model_id=model_id,
+                    summary=summary_info,
+                    clusters=cluster_summaries,
+                    metrics=metrics,
+                    timing=timing_info,
+                    algorithm=algo_norm,
+                    sample_recommendations=sample_recs,
+                )
+                if not save_ok:
+                    logger.error("MongoDB cluster model cache write failed for model [%s].", model_id)
+                    timing_info["cache_persisted"] = False
+                    timing_info["cache_diagnostic"] = "Cache write failed. Model results computed but not cached."
+                else:
+                    timing_info["cache_persisted"] = True
+                    timing_info["cache_diagnostic"] = None
+
+                await asyncio.to_thread(
+                    save_cluster_assignments,
+                    dataset_version=dataset_version,
+                    model_id=model_id,
+                    reader_assignments=engine.reader_assignments,
+                )
+                await asyncio.to_thread(
+                    record_clustering_run,
+                    dataset_version=dataset_version,
+                    n_clusters=engine.n_clusters,
+                    rating_threshold=rating_threshold,
+                    algorithm=algo_norm,
+                    inertia=metrics["inertia"],
+                    usable_readers=len(reader_ids),
+                    usable_books=len(feature_book_ids),
+                    total_seconds=total_elapsed,
+                    source="fresh_kmeans_computation",
+                    cache_hit=False,
+                )
+
+            # Update active in-memory engine for fast subsequent /recommend queries
+            _active_engine = engine
+            _active_model_id = model_id
+            _active_dataset_version = dataset_version
+
+            logger.info(
+                "<-- [COMPLETED] K-Means Clustering finished in %.3fs (Inertia: %.2f, Usable Readers: %d)",
+                total_elapsed,
+                metrics["inertia"],
+                len(reader_ids),
+            )
+
+            response_data = {
+                "status": "success",
+                "model_id": model_id,
+                "dataset_version": dataset_version,
+                "summary": summary_info,
+                "metrics": metrics,
+                "clusters": cluster_summaries,
+                "sample_recommendations": sample_recs,
+                "timing": timing_info,
+            }
+
+            if is_leader and task_key in _in_flight_tasks and not _in_flight_tasks[task_key].done():
+                _in_flight_tasks[task_key].set_result(response_data)
+
+            return response_data
+
+    except HTTPException as he:
+        if is_leader and task_key and task_key in _in_flight_tasks and not _in_flight_tasks[task_key].done():
+            _in_flight_tasks[task_key].set_exception(he)
         raise
     except Exception as e:
-        total_elapsed = time.time() - request_start_time
-        logger.exception("Unexpected error in /analyze after %.2fs: %s", total_elapsed, e)
-        raise HTTPException(status_code=500, detail=f"Analysis failed: {str(e)}")
+        if is_leader and task_key and task_key in _in_flight_tasks and not _in_flight_tasks[task_key].done():
+            _in_flight_tasks[task_key].set_exception(e)
+        total_elapsed = time.perf_counter() - request_start_time
+        logger.exception("Unexpected error in /analyze after %.3fs: %s", total_elapsed, e)
+        raise HTTPException(status_code=500, detail=f"Clustering analysis failed: {str(e)}")
     finally:
-        # Guarantee cleanup of all temporary uploaded CSV files
-        t_clean = time.time()
-        cleaned = 0
+        if is_leader and task_key:
+            async with _in_flight_lock:
+                _in_flight_tasks.pop(task_key, None)
         if books_temp_path and books_temp_path.exists():
             try:
                 books_temp_path.unlink()
-                cleaned += 1
-            except Exception as e:
-                logger.warning("Failed to clean up %s: %s", books_temp_path, e)
+            except Exception:
+                pass
         if ratings_temp_path and ratings_temp_path.exists():
             try:
                 ratings_temp_path.unlink()
-                cleaned += 1
-            except Exception as e:
-                logger.warning("Failed to clean up %s: %s", ratings_temp_path, e)
-        logger.info("Temporary cleanup finished in %.3fs (%d files removed)", time.time() - t_clean, cleaned)
+            except Exception:
+                pass
+
+
+# ---------------------------------------------------------------------------
+# Recommendation & Cluster Inspection Endpoints
+# ---------------------------------------------------------------------------
+
+@app.get("/recommend/{reader_id}")
+def get_recommendations_for_reader(
+    reader_id: str,
+    n: int = Query(10, ge=1, le=50),
+    dataset_version: Optional[str] = None,
+    model_id: Optional[str] = None,
+):
+    """
+    Generates personalized recommendations for a specific reader.
+    Uses active in-memory trained K-Means engine if available, or looks up assignments from MongoDB.
+    Excludes books already rated by the reader.
+    Falls back gracefully to global Bayesian average for cold-start readers.
+    """
+    global _active_engine, _active_model_id, _active_dataset_version
+    if _active_engine is not None and bool(getattr(_active_engine, "reader_history", None)):
+        rec_data = _active_engine.recommend_for_reader(reader_id, n_recommendations=n)
+        return rec_data
+
+    # If no active model in memory with reader_history, check MongoDB cluster assignments
+    d_ver = dataset_version or _active_dataset_version
+    m_id = model_id or _active_model_id
+    if d_ver and m_id:
+        c_id = get_reader_cluster_assignment(d_ver, m_id, reader_id)
+        if c_id is not None:
+            c_details = get_cluster_details(d_ver, m_id, c_id)
+            if c_details:
+                top_books = c_details.get("top_representative_books", [])[:n]
+                return {
+                    "reader_id": reader_id,
+                    "is_cold_start": False,
+                    "assigned_cluster": c_id,
+                    "cluster_size": c_details.get("size", 0),
+                    "recommendations": top_books,
+                    "source": "mongodb_cluster_assignment",
+                }
+        else:
+            # Cold-start reader: fallback to representative books from cluster 0
+            c_details = get_cluster_details(d_ver, m_id, 0)
+            if c_details:
+                top_books = c_details.get("top_representative_books", [])[:n]
+                return {
+                    "reader_id": reader_id,
+                    "is_cold_start": True,
+                    "assigned_cluster": 0,
+                    "cluster_size": c_details.get("size", 0),
+                    "recommendations": top_books,
+                    "source": "mongodb_cold_start_fallback",
+                }
+
+    if _active_engine is not None:
+        rec_data = _active_engine.recommend_for_reader(reader_id, n_recommendations=n)
+        return rec_data
+
+    raise HTTPException(
+        status_code=400,
+        detail="No active clustering model found. Please run K-Means clustering via /analyze first.",
+    )
+
+
+@app.get("/clusters")
+def get_clusters():
+    """Returns summaries of all reader clusters from the active model."""
+    global _active_engine
+    if _active_engine is None:
+        raise HTTPException(status_code=400, detail="No active clustering model. Run /analyze first.")
+    return {
+        "model_id": _active_model_id,
+        "dataset_version": _active_dataset_version,
+        "clusters": _active_engine.get_cluster_summaries(top_n_books=8),
+    }
+
+
+@app.get("/clusters/{cluster_id}")
+def get_cluster(cluster_id: int):
+    """Returns detailed statistics and top books for a specific cluster ID."""
+    global _active_engine
+    if _active_engine is None:
+        raise HTTPException(status_code=400, detail="No active clustering model. Run /analyze first.")
+    if cluster_id < 0 or cluster_id >= _active_engine.n_clusters:
+        raise HTTPException(status_code=404, detail=f"Cluster {cluster_id} does not exist.")
+
+    summaries = _active_engine.get_cluster_summaries(top_n_books=15)
+    target = next((c for c in summaries if c["cluster_id"] == cluster_id), None)
+    if not target:
+        raise HTTPException(status_code=404, detail=f"Cluster {cluster_id} not found.")
+    return target
+
+
+@app.get("/evaluate")
+def evaluate_model(test_ratio: float = Query(0.20, ge=0.05, le=0.50), k: int = Query(10, ge=1, le=20)):
+    """
+    Evaluates recommendation quality (Precision@K, Recall@K, HitRate@K)
+    using a held-out test split of reader ratings.
+    """
+    global _active_engine
+    if _active_engine is None:
+        raise HTTPException(status_code=400, detail="No active clustering model. Run /analyze first.")
+
+    res = _active_engine.evaluate_offline(test_ratio=test_ratio, k=k)
+    return res
+
+
+# ---------------------------------------------------------------------------
+# One-Time Dataset Import Endpoint
+# ---------------------------------------------------------------------------
+
+@app.post("/import-dataset")
+async def import_dataset_endpoint(
+    books_file: UploadFile = File(...),
+    ratings_file: Optional[UploadFile] = File(None),
+    rating_threshold: float = Form(3.0),
+    force: bool = Form(False),
+    store_raw_ratings: bool = Form(False),
+    max_ratings: int = Form(500_000),
+):
+    """
+    Dedicated endpoint for one-time ingestion of books.csv and optional ratings.csv into MongoDB Atlas.
+    """
+    if not is_db_connected():
+        raise HTTPException(
+            status_code=503,
+            detail="MongoDB is not connected. Ingestion requires an active database connection.",
+        )
+
+    t0 = time.perf_counter()
+    books_path, _, _ = await save_upload_to_temp(books_file)
+    ratings_path: Optional[Path] = None
+
+    try:
+        books_res = await asyncio.to_thread(import_books_from_csv, books_path)
+        raw_ratings_res: Optional[Dict[str, Any]] = None
+
+        if ratings_file is not None and store_raw_ratings:
+            ratings_path, _, _ = await save_upload_to_temp(ratings_file)
+            raw_ratings_res = await asyncio.to_thread(import_ratings_from_csv, ratings_path, max_ratings)
+
+        total_elapsed = round(time.perf_counter() - t0, 3)
+        return {
+            "status": "success",
+            "elapsed_seconds": total_elapsed,
+            "books_import": books_res,
+            "raw_ratings_import": raw_ratings_res,
+        }
+    finally:
+        if books_path and books_path.exists():
+            books_path.unlink(missing_ok=True)
+        if ratings_path and ratings_path.exists():
+            ratings_path.unlink(missing_ok=True)
